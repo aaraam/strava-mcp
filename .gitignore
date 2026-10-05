@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.venv/
+session.json
+profiles/
+extracted_activities.json
+extraction_verification.json
+surface_audit.json
+surface_confirmation.json
