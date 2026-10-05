@@ -1,8 +1,8 @@
 # Strava MCP — read-only, multi-profile adapter
 
 This server exposes named Strava credential profiles through read-only MCP
-tools. Each person can connect their own Strava credential locally; credentials
-are never accepted as MCP tool arguments and are never included in responses.
+tools. Credentials stay local: they are never accepted as MCP tool arguments
+and are never included in responses.
 
 ## Run
 
@@ -10,7 +10,16 @@ The tested environment is:
 
     /tmp/strava-research/venv/bin/python /home/armistice/.ssh/strava-mcp/server.py
 
-By default, profiles are loaded from:
+The simplest setup is a mode-600 `.env` next to `server.py`:
+
+    STRAVA_EMAIL=you@example.com
+    STRAVA_PASSWORD=YOUR_PASSWORD
+
+The server logs in to Strava's web session once per process and keeps the
+resulting session cookie in memory. Set STRAVA_ENV_FILE to use a different
+env-file path. Process environment variables override values from the file.
+
+For compatibility, profiles are also loaded from:
 
     /home/armistice/.ssh/strava-mcp/profiles/<profile>.json
 
@@ -24,7 +33,9 @@ For compatibility, the original STRAVA_SESSION_FILE environment variable and
 the project-local session.json are still accepted for the default profile.
 STRAVA_ACCESS_TOKEN or STRAVA_SESSION_COOKIE can also configure only the
 default profile. Do not put a credential in chat, source control, or an MCP
-tool call.
+tool call. Email/password mode is only available for accounts that can use a
+Strava password; Google, Apple, and one-time-code-only accounts need another
+supported credential.
 
 ## Connect a browser profile
 
@@ -60,9 +71,10 @@ The browser-session adapter was live-tested against the authorized account:
 activity history pagination and activity pages returned data, while streams,
 laps, and training-log routes were denied or unavailable. API-token mode is
 implemented for athlete, activity search/details, streams, gear, statistics,
-and training-log reads, subject to Strava account permissions. This remains a
-private, reverse-engineered adapter rather than an official Strava API client;
-coverage is not guaranteed to be complete or stable.
+and training-log reads, subject to Strava account permissions. Email/password
+mode uses the same read-only web-session adapter after logging in. This remains
+a private, reverse-engineered adapter rather than an official Strava API
+client; coverage is not guaranteed to be complete or stable.
 
 The adapter uses only fixed GET routes, does not follow redirects, does not
 retry authentication/rate-limit failures, verifies activity ownership before

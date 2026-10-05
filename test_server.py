@@ -1,9 +1,11 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 import httpx
-from server import CredentialStore, StravaClient, StravaError
+from server import AuthCredentials, CredentialStore, StravaClient, StravaError
 
 
 class ClientTests(unittest.TestCase):
@@ -105,6 +107,139 @@ class ClientTests(unittest.TestCase):
         result = CredentialStore(credentials_dir=profiles).status("alice")
         self.assertEqual(result["credential_kind"], "access_token")
         self.assertNotIn("secret-token", json.dumps(result))
+
+
+class EnvironmentCredentialTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.env_file = Path(self.tmp.name) / ".env"
+
+    def write_env(self, text, mode=0o600):
+        self.env_file.write_text(text)
+        self.env_file.chmod(mode)
+
+    def test_email_password_loaded_from_env_file(self):
+        self.write_env("STRAVA_EMAIL=runner@example.com\nSTRAVA_PASSWORD='secret pass'\n")
+        store = CredentialStore(env_file=self.env_file)
+        credentials = store.credentials()
+        self.assertEqual(credentials, AuthCredentials(
+            "email_password", "runner@example.com", "secret pass"))
+        self.assertEqual(store.status(), {
+            "profile": "default", "configured": True,
+            "credential_kind": "email_password", "source": "environment", "path": None})
+        self.assertEqual(store.list_profiles(), ["default"])
+        self.assertNotIn("secret", json.dumps(store.status()))
+
+    def test_process_environment_overrides_env_file(self):
+        self.write_env("STRAVA_EMAIL=file@example.com\nSTRAVA_PASSWORD=file-pass\n")
+        with patch.dict(os.environ, {"STRAVA_EMAIL": "process@example.com",
+                                     "STRAVA_PASSWORD": "process-pass"}, clear=False):
+            credentials = CredentialStore(env_file=self.env_file).credentials()
+        self.assertEqual(credentials.email, "process@example.com")
+        self.assertEqual(credentials.password, "process-pass")
+
+    def test_partial_login_configuration_is_rejected_without_secret(self):
+        self.write_env("STRAVA_EMAIL=runner@example.com\n")
+        store = CredentialStore(env_file=self.env_file)
+        with self.assertRaisesRegex(StravaError, "both STRAVA_EMAIL and STRAVA_PASSWORD"):
+            store.credentials()
+        status = store.status()
+        self.assertFalse(status["configured"])
+        self.assertNotIn("runner@example.com", json.dumps(status))
+
+    def test_env_file_permissions_are_required(self):
+        self.write_env("STRAVA_EMAIL=runner@example.com\nSTRAVA_PASSWORD=secret\n", 0o644)
+        with self.assertRaisesRegex(StravaError, "permissions 600"):
+            CredentialStore(env_file=self.env_file)
+
+    def test_login_and_token_configuration_cannot_be_mixed(self):
+        self.write_env("STRAVA_EMAIL=runner@example.com\nSTRAVA_PASSWORD=secret\n"
+                       "STRAVA_ACCESS_TOKEN=token\n")
+        with self.assertRaisesRegex(StravaError, "either token/cookie or email/password"):
+            CredentialStore(env_file=self.env_file).credentials()
+
+
+class LoginTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.env_file = Path(self.tmp.name) / ".env"
+        self.env_file.write_text("STRAVA_EMAIL=runner@example.com\nSTRAVA_PASSWORD=secret-pass\n")
+        self.env_file.chmod(0o600)
+        self.requests = []
+
+    def client(self, handler):
+        store = CredentialStore(env_file=self.env_file)
+        return StravaClient(credential_store=store,
+                            transport=httpx.MockTransport(handler), interval=0)
+
+    def test_login_form_post_and_authenticated_api_request(self):
+        def respond(request):
+            self.requests.append(request)
+            if request.url.path == "/login":
+                return httpx.Response(200, text=(
+                    '<form action="/session" method="post">'
+                    '<input type="hidden" name="utf8" value="✓">'
+                    '<input type="hidden" name="authenticity_token" value="csrf-token">'
+                    '<input name="email"><input name="password" type="password">'
+                    '</form>'))
+            if request.url.path == "/session":
+                form = httpx.QueryParams(request.content.decode())
+                self.assertEqual(form["email"], "runner@example.com")
+                self.assertEqual(form["password"], "secret-pass")
+                self.assertEqual(form["authenticity_token"], "csrf-token")
+                return httpx.Response(302, headers={
+                    "Location": "/dashboard",
+                    "Set-Cookie": "_strava4_session=logged-in-cookie; Path=/"})
+            if request.url.path == "/api/v3/athlete":
+                self.assertIn("_strava4_session=logged-in-cookie",
+                              request.headers.get("Cookie", ""))
+                self.assertNotIn("Authorization", request.headers)
+                return httpx.Response(200, json={"id": 7})
+            raise AssertionError(f"unexpected request: {request.url}")
+
+        client = self.client(respond)
+        self.assertEqual(client.get("athlete"), {"id": 7})
+        self.assertEqual(client.get("athlete"), {"id": 7})
+        self.assertEqual([request.url.path for request in self.requests],
+                         ["/login", "/session", "/api/v3/athlete", "/api/v3/athlete"])
+
+    def test_failed_login_does_not_expose_password(self):
+        def respond(request):
+            if request.url.path == "/login":
+                return httpx.Response(200, text='<form action="/session"><input name="authenticity_token" value="csrf"></form>')
+            return httpx.Response(200, text="invalid credentials")
+
+        with self.assertRaises(StravaError) as result:
+            self.client(respond).get("athlete")
+        self.assertNotIn("secret-pass", str(result.exception))
+
+    def test_login_form_endpoint_is_validated(self):
+        def respond(request):
+            return httpx.Response(200, text='<form action="https://example.org/session"></form>')
+
+        with self.assertRaisesRegex(StravaError, "unsupported endpoint"):
+            self.client(respond).get("athlete")
+
+    def test_email_login_uses_web_activity_history(self):
+        def respond(request):
+            self.requests.append(request)
+            if request.url.path == "/login":
+                return httpx.Response(200, text='<form action="/session"></form>')
+            if request.url.path == "/session":
+                return httpx.Response(302, headers={
+                    "Location": "/dashboard",
+                    "Set-Cookie": "_strava4_session=logged-in-cookie; Path=/"})
+            if request.url.path == "/athlete/training_activities":
+                self.assertIn("_strava4_session=logged-in-cookie",
+                              request.headers.get("Cookie", ""))
+                return httpx.Response(200, json={"models": []})
+            raise AssertionError(f"unexpected request: {request.url}")
+
+        self.assertEqual(self.client(respond).activities(), {"models": []})
+        self.assertEqual([request.url.path for request in self.requests],
+                         ["/login", "/session", "/athlete/training_activities"])
 
 
 if __name__ == "__main__":
